@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# jht-telegram-send — invia un messaggio al bot Telegram di un agente.
+#
+# Schema 2026-05-13 rev2: 3 bot dedicati (assistente, capitano, mentor)
+# in channels.telegram.bots.<role>. Ogni agente parla all'utente sul SUO bot.
+#
+# Risoluzione token + chat_id:
+#   1. ENV: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (override esplicito)
+#   2. config: $JHT_HOME/jht.config.json → channels.telegram.bots.<role>
+#      (role default: $JHT_TG_BOT_ROLE oppure "assistente")
+#   3. fallback creds: $JHT_HOME/credentials/telegram_bot.json (.token)
+#      [legacy — usato solo se config mancante]
+#
+# Uso:
+#   jht-telegram-send "<testo>"                       # bot assistente (default)
+#   jht-telegram-send --from capitano "<testo>"       # bot Capitano
+#   jht-telegram-send --from mentor --html "<b>x</b>"
+#   jht-telegram-send --chat-id 123 "<testo>"         # override chat_id
+#
+# Exit:
+#   0 → consegnato (HTTP 200, ok:true)
+#   1 → argomenti mancanti / ruolo invalido
+#   2 → token assente
+#   3 → chat_id assente
+#   4 → errore di rete o HTTP non-200
+#   5 → Bot API ha risposto ok:false
+
+set -euo pipefail
+
+parse_mode=""
+chat_id_override=""
+role="${JHT_TG_BOT_ROLE:-assistente}"
+keyboard_role=""
+photo_path=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --html)
+      parse_mode="HTML"; shift ;;
+    --markdown)
+      parse_mode="MarkdownV2"; shift ;;
+    --chat-id)
+      chat_id_override="${2:-}"; shift 2 ;;
+    --from)
+      role="${2:-}"; shift 2 ;;
+    --keyboard)
+      # F-1.B: allega reply keyboard persistente. Valore = ruolo
+      # (assistente|capitano|mentor) — definisce il layout dei bottoni.
+      # Se vuoto/role mismatch, ignorato silenziosamente.
+      keyboard_role="${2:-}"; shift 2 ;;
+    --photo)
+      # F-1.D bug #16: invia foto via sendPhoto. Il `<text>` posizionale
+      # diventa caption (max 1024 char, Telegram cap). Photo > 10MB
+      # restituisce errore Telegram, nessun fallback automatico.
+      photo_path="${2:-}"; shift 2 ;;
+    --)
+      shift; break ;;
+    -*)
+      echo "jht-telegram-send: flag sconosciuto: $1" >&2
+      exit 1 ;;
+    *)
+      break ;;
+  esac
+done
+
+case "$role" in
+  assistente|capitano|mentor) ;;
+  *)
+    echo "jht-telegram-send: --from deve essere assistente|capitano|mentor (ricevuto: '$role')" >&2
+    exit 1 ;;
+esac
+
+if [ $# -lt 1 ]; then
+  echo "Usage: jht-telegram-send [--from <role>] [--html|--markdown] [--chat-id <id>] <text>" >&2
+  exit 1
+fi
+
+text="$*"
+# Gli agenti tendono a scrivere `\n\n` come separatore paragrafi (è la
+# convenzione naturale in stringhe singole), confidando che venga
+# interpretato come newline. In bash NON è automatico: senza
+# trasformazione, Telegram riceve i 4 caratteri letterali `\`, `n`, `\`,
+# `n` (vedi screenshot 2026-05-16: messaggi welcome con `\n\n` visibili).
+# Interpretiamo solo le escape comuni (\n, \t, \r, \\) — niente printf
+# '%b' che processerebbe anche \c (stop output) e altre fragili.
+text="${text//\\n/$'\n'}"
+text="${text//\\t/$'\t'}"
+text="${text//\\r/$'\r'}"
+jht_home="${JHT_HOME:-$HOME/.jht}"
+config_path="$jht_home/jht.config.json"
+creds_path="$jht_home/credentials/telegram_bot.json"
+
+# ── Outgoing log (OBS-TELEGRAM-SEND-LOG) ──────────────────────────────
+# Append JSON line per ogni invio (ok o ko) a $JHT_HOME/logs/telegram-sent.jsonl.
+# SOLO metadati — niente body, niente caption, niente photo path. Permette
+# di rispondere a "quanti msg/h", "delta agente→utente", "% errori" senza
+# leak di contenuti privati.
+# Idempotente verso il bot esterno: il log è side-effect locale, niente retry
+# su fail log (>>) — se il disco fallisce, non blocchiamo l'invio.
+_log_outgoing() {
+  local kind="$1" ok="$2" http="$3" chars="$4" chunks="${5:-1}"
+  local log_dir="$jht_home/logs"
+  local log_file="$log_dir/telegram-sent.jsonl"
+  mkdir -p "$log_dir" 2>/dev/null || return 0
+  printf '{"ts":"%s","from":"%s","chat_id":"%s","kind":"%s","ok":%s,"http":%s,"chars":%d,"chunks":%d,"parse_mode":"%s","keyboard":"%s"}\n' \
+    "$(date -u +%FT%TZ)" "$role" "$chat_id" "$kind" "$ok" "${http:-null}" \
+    "$chars" "$chunks" "${parse_mode:-}" "${keyboard_role:-}" \
+    >> "$log_file" 2>/dev/null || true
+}
+
+# ── Risoluzione token ─────────────────────────────────────────────────
+token="${TELEGRAM_BOT_TOKEN:-}"
+if [ -z "$token" ] && [ -f "$config_path" ]; then
+  token=$(python3 -c "import json,sys
+try:
+  print(json.load(open(sys.argv[1])).get('channels',{}).get('telegram',{}).get('bots',{}).get(sys.argv[2],{}).get('bot_token',''))
+except Exception:
+  pass" "$config_path" "$role" 2>/dev/null || true)
+fi
+if [ -z "$token" ] && [ -f "$creds_path" ]; then
+  # Fallback legacy: file credentials/telegram_bot.json (un solo token, no role)
+  token=$(python3 -c "import json,sys
+try:
+  print(json.load(open(sys.argv[1])).get('token',''))
+except Exception:
+  pass" "$creds_path" 2>/dev/null || true)
+fi
+
+if [ -z "$token" ]; then
+  echo "jht-telegram-send: token Telegram non trovato per ruolo '$role' (env TELEGRAM_BOT_TOKEN, channels.telegram.bots.$role in $config_path, o $creds_path)" >&2
+  exit 2
+fi
+
+# ── Risoluzione chat_id ────────────────────────────────────────────────
+chat_id="$chat_id_override"
+[ -z "$chat_id" ] && chat_id="${TELEGRAM_CHAT_ID:-}"
+if [ -z "$chat_id" ] && [ -f "$config_path" ]; then
+  chat_id=$(python3 -c "import json,sys
+try:
+  print(json.load(open(sys.argv[1])).get('channels',{}).get('telegram',{}).get('bots',{}).get(sys.argv[2],{}).get('chat_id',''))
+except Exception:
+  pass" "$config_path" "$role" 2>/dev/null || true)
+fi
+
+if [ -z "$chat_id" ]; then
+  echo "jht-telegram-send: chat_id non trovato per ruolo '$role' (env TELEGRAM_CHAT_ID, --chat-id, o channels.telegram.bots.$role.chat_id in $config_path)" >&2
+  exit 3
+fi
+
+# ── F-1.D bug #16: sendPhoto multipart se --photo presente ─────────────
+# Esce subito dopo il photo upload — il caller usa il `<text>` come
+# caption, niente chunking secondario. Per testo lungo + photo, mandare
+# il photo prima (caption breve) e il resto del testo in chiamate
+# separate.
+if [ -n "$photo_path" ]; then
+  if [ ! -f "$photo_path" ]; then
+    echo "jht-telegram-send: --photo file non trovato: $photo_path" >&2
+    exit 1
+  fi
+  # Caption massima Telegram = 1024 chars. Tronchiamo se necessario.
+  caption="${text:0:1000}"
+  resp=$(mktemp)
+  http_code=$(curl --silent --show-error --max-time 30 \
+    --output "$resp" --write-out '%{http_code}' \
+    -F "chat_id=$chat_id" \
+    -F "photo=@${photo_path}" \
+    -F "caption=$caption" \
+    ${parse_mode:+-F "parse_mode=$parse_mode"} \
+    "https://api.telegram.org/bot${token}/sendPhoto" || echo "000")
+  body=$(cat "$resp"); rm -f "$resp"
+  if [ "$http_code" != "200" ]; then
+    _log_outgoing "photo" "false" "$http_code" "${#caption}" 1
+    echo "jht-telegram-send: sendPhoto HTTP $http_code — $body" >&2
+    exit 4
+  fi
+  ok=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('ok'))" "$body" 2>/dev/null || echo "False")
+  if [ "$ok" != "True" ]; then
+    _log_outgoing "photo" "false" "$http_code" "${#caption}" 1
+    echo "jht-telegram-send: sendPhoto Bot API ok=false — $body" >&2
+    exit 5
+  fi
+  _log_outgoing "photo" "true" "$http_code" "${#caption}" 1
+  echo "jht-telegram-send: photo ok ($(wc -c < "$photo_path") B, caption ${#caption} chars, chat $chat_id)"
+  exit 0
+fi
+
+# ── Chunking 4096 (limite Bot API) ─────────────────────────────────────
+# Telegram chiude su 4096 caratteri/messaggio. Spezziamo su newline quando
+# possibile, altrimenti taglio secco. La gestione corretta dei multibyte
+# UTF-8 sarebbe Python; per ora awk + cut byte-safe.
+MAX_LEN=4000
+
+# F-1.B: layout reply-keyboard per ruolo. Compatto 2-cols, emoji-prefixed
+# così i bottoni sono leggibili anche su mobile in light theme.
+keyboard_json_for() {
+  case "$1" in
+    assistente) cat <<'EOF'
+{"keyboard":[[{"text":"📊 Budget"},{"text":"📈 Pipeline"}],[{"text":"🗺️ Mappa"},{"text":"⭐ Top CV"}],[{"text":"📅 Reset"},{"text":"❓ Help"}]],"is_persistent":true,"resize_keyboard":true}
+EOF
+      ;;
+    capitano) cat <<'EOF'
+{"keyboard":[[{"text":"📈 Pipeline"},{"text":"📊 Budget"}],[{"text":"👥 Team"},{"text":"⭐ Ready"}],[{"text":"🛠 Triage"},{"text":"❓ Help"}]],"is_persistent":true,"resize_keyboard":true}
+EOF
+      ;;
+    mentor) cat <<'EOF'
+{"keyboard":[[{"text":"📋 Digest"},{"text":"🔁 Patterns"}],[{"text":"⭐ Top"},{"text":"💰 Salary"}],[{"text":"❓ Help"}]],"is_persistent":true,"resize_keyboard":true}
+EOF
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+send_one() {
+  local body="$1"
+  local http_code
+  local response_file
+  response_file=$(mktemp)
+
+  # form-encoded: text supporta newline letterali via --data-urlencode
+  local args=(
+    --silent --show-error
+    --max-time 20
+    --output "$response_file"
+    --write-out '%{http_code}'
+    --data-urlencode "chat_id=$chat_id"
+    --data-urlencode "text=$body"
+  )
+  if [ -n "$parse_mode" ]; then
+    args+=( --data-urlencode "parse_mode=$parse_mode" )
+  fi
+  # F-1.B: keyboard solo nell'ultimo chunk (Telegram mostra il reply_markup
+  # dell'ULTIMO message del thread). Decideremo nel caller quale chunk è
+  # l'ultimo via la variabile `is_last_chunk`. Per ora il send_one allega
+  # SEMPRE se KEYBOARD_JSON è settata (caller responsabile di settarla
+  # solo per l'ultimo chunk).
+  if [ -n "${KEYBOARD_JSON:-}" ]; then
+    args+=( --data-urlencode "reply_markup=$KEYBOARD_JSON" )
+  fi
+
+  http_code=$(curl "${args[@]}" "https://api.telegram.org/bot${token}/sendMessage" || echo "000")
+
+  local resp
+  resp=$(cat "$response_file" 2>/dev/null || true)
+  rm -f "$response_file"
+
+  if [ "$http_code" != "200" ]; then
+    _log_outgoing "text" "false" "$http_code" "${#body}" 1
+    echo "jht-telegram-send: HTTP $http_code — $resp" >&2
+    return 4
+  fi
+
+  local ok
+  ok=$(python3 -c "import json,sys
+try:
+  print(json.loads(sys.argv[1]).get('ok'))
+except Exception:
+  print('False')" "$resp" 2>/dev/null || echo "False")
+
+  if [ "$ok" != "True" ]; then
+    _log_outgoing "text" "false" "$http_code" "${#body}" 1
+    echo "jht-telegram-send: Bot API ok=false — $resp" >&2
+    return 5
+  fi
+
+  _log_outgoing "text" "true" "$http_code" "${#body}" 1
+  return 0
+}
+
+# Risolvi il JSON della keyboard una volta sola fuori dal loop chunks.
+keyboard_json_resolved=""
+if [ -n "$keyboard_role" ]; then
+  keyboard_json_resolved="$(keyboard_json_for "$keyboard_role" | tr -d '\n')"
+  if [ -z "$keyboard_json_resolved" ]; then
+    echo "jht-telegram-send: --keyboard '$keyboard_role' sconosciuto, ignorato" >&2
+  fi
+fi
+
+# Split semplice su newline rispettando MAX_LEN. Conta gli chunks per
+# decidere quale è l'ultimo (la reply_markup va solo lì, altrimenti il
+# 1° messaggio mostra la keyboard che poi sparisce al 2°).
+mapfile -d '' -t _chunks < <(python3 - "$text" "$MAX_LEN" <<'PYEOF'
+import sys
+text, max_len = sys.argv[1], int(sys.argv[2])
+def chunks(s, n):
+    out = []
+    while len(s) > n:
+        cut = s.rfind('\n', 0, n)
+        if cut <= 0:
+            cut = s.rfind(' ', 0, n)
+        if cut <= 0:
+            cut = n
+        out.append(s[:cut])
+        s = s[cut:].lstrip()
+    if s:
+        out.append(s)
+    return out
+for c in chunks(text, max_len):
+    sys.stdout.write(c + '\0')
+PYEOF
+)
+
+_total=${#_chunks[@]}
+for _i in "${!_chunks[@]}"; do
+  if [ "$((_i + 1))" -eq "$_total" ] && [ -n "$keyboard_json_resolved" ]; then
+    KEYBOARD_JSON="$keyboard_json_resolved" send_one "${_chunks[$_i]}" || exit $?
+  else
+    send_one "${_chunks[$_i]}" || exit $?
+  fi
+done
+
+echo "jht-telegram-send: ok (${#text} chars to chat $chat_id)"
+exit 0

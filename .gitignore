@@ -1,0 +1,154 @@
+# ══════════════════════════════════════════════════════════════
+# .gitignore — Job Hunter Team
+# REGOLA: se non sei sicuro, NON committare. Chiedi prima.
+# ══════════════════════════════════════════════════════════════
+
+# ── SECRETS E CONFIG LOCALI ──────────────────────────────────
+.env
+.env.local
+.env.*.local
+.env.vercel
+.env.vercel.*
+.mcp.json
+*.mcp.json
+CLAUDE.md
+.agents/
+auth-state.json
+google-oauth-*.json
+google-service-account.json
+linkedin-cookies.json
+.secrets-patterns
+
+# ── SECURITY AUDIT — vulnerabilità APERTE, MAI su repo pubblica ──
+# Report red-team con falle non ancora corrette: è una roadmap di
+# attacco. Rimuovere dall'ignore solo dopo che le falle sono chiuse.
+docs/internal/*security-audit*
+docs/internal/*-red-team*
+
+# ── DATI PERSONALI — MAI committare ─────────────────────────
+# PDF: CV, cover letter, documenti personali
+*.pdf
+
+# Database SQLite (dati candidature)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Applications: CV e lettere generate
+shared/data/applications/
+
+# LinkedIn: alerts, job data
+shared/data/linkedin-alerts/
+shared/data/incoming/
+
+# Telegram: sessioni e dati personali (il bridge code e' versionato)
+
+# Screenshot con dati personali
+*.png
+!web/public/**/*.png
+!web/app/**/*.png
+!assets/banner.png
+!desktop/assets/icon.png
+# Arte di gioco GENERATA (niente screenshot qui: zero PII by design)
+!game/assets/**/*.png
+# Reference visivi del gioco generati da Codex su dati mock (zero PII)
+!game/docs/reference/**/*.png
+# Session reports versionati (analisi grafici budget, throttle, ecc.)
+!docs/sessions/**/*.png
+
+# Gap report e dati analisi personali
+shared/data/gap-report.json
+
+# Candidate profile (dati personali)
+candidate_profile.yml
+candidate_profile.example.yml
+
+# Note operative private (onboarding beta tester, piani migrazione/account, ecc.)
+docs/internal/private/
+
+# ── CHIAVI E CERTIFICATI ─────────────────────────────────────
+shared/secrets/*
+!shared/secrets/.gitkeep
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ── BUILD E DIPENDENZE ──────────────────────────────────────
+node_modules/
+
+# Rust build artifacts
+launcher/target/
+
+# Desktop build artifacts
+desktop/dist/
+desktop/app-payload/
+
+# Download binaries (served at runtime, not committed)
+web/public/downloads/
+
+.next/
+__pycache__/
+*.pyc
+*.pyo
+.vercel/
+dist/
+build/
+!desktop/build/
+
+# ── OS ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ── IDE ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── CLAUDE CODE ──────────────────────────────────────────────
+.claude/
+
+# ── PLAYWRIGHT MCP ───────────────────────────────────────────
+.playwright-mcp/
+.vercel
+
+# ── SUPABASE ─────────────────────────────────────────────────────────────────
+supabase/.temp/
+
+# ── DEV SERVER LOGS ──────────────────────────────────────────────────────────
+.next-dev-*.log
+.next-dev-*.err.log
+
+# ── E2E MANUAL TEST RUNS ─────────────────────────────────────────────────────
+# Sessioni manuali di test end-to-end (note, screenshot, output di checkup, ecc.)
+# Gli e2e automatizzati stanno in e2e/ e sono versionati normalmente.
+e2e-runs/
+
+# ── DEV LAUNCHER LOGS ────────────────────────────────────────────────────────
+# Log generati da scripts/dev-up.sh (host Next su :3001)
+.dev-logs/
+
+# ── THROTTLE SANDBOX ─────────────────────────────────────────────────────────
+# Micro-ambiente per testare jht-throttle con kimi reale (repo separata dentro)
+seriea-sandbox/
+
+# Screenshot di test sessions con dati sensibili non ancora offuscati
+# (IP VPS, server IDs, IPv6, account names). Spostare in repo solo
+# dopo aver redatto le info sensibili.
+screenshots/
+# Eccezione: screenshot del sito PUBBLICO (dati già anonimi) usati dal README
+!assets/screenshots/
+!assets/screenshots/**
+
+# Materiale conversazioni private utente (voice, screenshot, ecc.)
+docs/internal/conversations/
+
+# Export /export di Claude Code (chat completa, materiale privato)
+*-local-command-caveat*.txt
+2026-*-local-command-caveat*.txt
+
+# Artefatti Playwright quando la suite gira dalla root del repo
+/reports/

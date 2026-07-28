@@ -1,0 +1,313 @@
+class_name GameSidebar
+extends CanvasLayer
+## Sidebar stile desktop-app dentro il gioco: stessi gruppi/voci/ordine
+## della app (SidebarDefs), veste terminale del gioco. Ogni voce apre un
+## SectionPanel; il contenuto vero delle sezioni arriverà con la migrazione.
+## Si apre/chiude con il bottone-linguetta ≡ in alto a sinistra.
+
+const WIDTH := 232.0
+
+signal chat_requested
+
+var _drawer: Control
+var _panel: SectionPanel
+var _buttons := {}  # id sezione → Button
+var _icons := {}  # id sezione → SidebarIcon (segue il colore del testo)
+var _open := false
+var _setup_cta: Button
+var _tab: Button
+
+func _init() -> void:
+	layer = 20
+
+func _ready() -> void:
+	add_to_group("game_sidebar")
+	var root := Control.new()
+	root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.theme = TerminalTheme.get_theme()
+	add_child(root)
+
+	# Il primo avvio non sequestra l'utente in un wizard: l'ufficio è subito
+	# esplorabile. Questo CTA resta visibile finché i tre prerequisiti non sono
+	# completi e porta alla checklist senza nascondere il mondo di gioco.
+	_setup_cta = Button.new()
+	_setup_cta.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	_setup_cta.position = Vector2(-190, 18)
+	_setup_cta.custom_minimum_size = Vector2(380, 44)
+	_setup_cta.add_theme_font_size_override("font_size", 14)
+	_setup_cta.add_theme_color_override("font_color", Palette.YELLOW)
+	_setup_cta.pressed.connect(_open_activation)
+	root.add_child(_setup_cta)
+	SetupService.status_changed.connect(_on_setup_status)
+	ScriptedOnboarding.action_requested.connect(_on_guided_action)
+	_on_setup_status(SetupService.status)
+
+	_drawer = PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(Palette.PANEL.r, Palette.PANEL.g, Palette.PANEL.b, 0.96)
+	style.border_color = Palette.BORDER_GLOW
+	style.set_border_width_all(TerminalTheme.hairline())
+	_drawer.add_theme_stylebox_override("panel", style)
+	_drawer.custom_minimum_size = Vector2(WIDTH, 0)
+	_drawer.set_anchors_preset(Control.PRESET_LEFT_WIDE)
+	_drawer.visible = false
+	root.add_child(_drawer)
+
+	# Linguetta apre il cassetto. Da aperto si nasconde (il cassetto la
+	# coprirebbe rendendo il menu impossibile da chiudere — Windows 22/07):
+	# la chiusura sta nell'header del cassetto, mai coperta da altri pannelli.
+	_tab = Button.new()
+	_tab.text = "≡"
+	_tab.add_theme_font_size_override("font_size", 26)
+	_tab.add_theme_color_override("font_color", Palette.GREEN)
+	_tab.add_theme_color_override("font_hover_color", Palette.MINT)
+	var tab_style := StyleBoxFlat.new()
+	tab_style.bg_color = Color(Palette.PANEL.r, Palette.PANEL.g, Palette.PANEL.b, 0.92)
+	tab_style.border_color = Palette.BORDER_GLOW
+	tab_style.set_border_width_all(TerminalTheme.hairline())
+	tab_style.content_margin_left = 12
+	tab_style.content_margin_right = 12
+	tab_style.content_margin_top = 4
+	tab_style.content_margin_bottom = 6
+	var tab_hover := tab_style.duplicate()
+	tab_hover.border_color = Palette.GREEN
+	_tab.add_theme_stylebox_override("normal", tab_style)
+	_tab.add_theme_stylebox_override("hover", tab_hover)
+	_tab.add_theme_stylebox_override("pressed", tab_hover.duplicate())
+	_tab.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	_tab.position = Vector2(10, 150)
+	_tab.pressed.connect(toggle)
+	root.add_child(_tab)
+
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_drawer.add_child(scroll)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 2)
+	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(box)
+
+	var brand := TerminalTheme.label("JOB HUNTER TEAM", 15, Palette.WHITE, "xbold")
+	brand.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	brand.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var brand_row := HBoxContainer.new()
+	brand_row.add_child(brand)
+	# Uscita a portata di mouse SEMPRE: la voce in fondo a Impostazioni finisce
+	# sotto lo scroll su schermi bassi, e in fullscreen su Wayland non esiste
+	# nemmeno la X della finestra.
+	var quit_btn := Button.new()
+	quit_btn.flat = true
+	quit_btn.tooltip_text = UIStrings.t("pause.quit")
+	quit_btn.custom_minimum_size = Vector2(26, 26)
+	quit_btn.pressed.connect(func() -> void: Game.open_pause())
+	var quit_icon := SidebarIcon.new("power", Palette.DIM)
+	quit_icon.set_anchors_preset(Control.PRESET_CENTER)
+	quit_icon.offset_left = -9
+	quit_icon.offset_right = 9
+	quit_icon.offset_top = -9
+	quit_icon.offset_bottom = 9
+	quit_btn.add_child(quit_icon)
+	quit_btn.mouse_entered.connect(func() -> void: quit_icon.color = Palette.RED)
+	quit_btn.mouse_exited.connect(func() -> void: quit_icon.color = Palette.DIM)
+	brand_row.add_child(quit_btn)
+	var close_btn := Button.new()
+	close_btn.flat = true
+	close_btn.text = "‹"
+	close_btn.tooltip_text = "Chiudi il menu"
+	close_btn.add_theme_font_size_override("font_size", 22)
+	close_btn.add_theme_color_override("font_color", Palette.DIM)
+	close_btn.add_theme_color_override("font_hover_color", Palette.WHITE)
+	close_btn.pressed.connect(toggle)
+	brand_row.add_child(close_btn)
+	var brand_pad := MarginContainer.new()
+	for side in ["top", "bottom"]:
+		brand_pad.add_theme_constant_override("margin_" + side, 14)
+	brand_pad.add_theme_constant_override("margin_right", 10)
+	brand_pad.add_child(brand_row)
+	box.add_child(brand_pad)
+
+	# TEST-AUTO: JHT_SIDEBAR=1 apre il cassetto al boot (per gli screenshot);
+	# JHT_SECTION=<id> apre anche il pannello di quella sezione. Un solo
+	# toggle: due deferred (JHT_SIDEBAR + JHT_SECTION valutati a _open ancora
+	# false) aprivano e richiudevano il cassetto nello stesso frame.
+	var sec := OS.get_environment("JHT_SECTION")
+	if OS.get_environment("JHT_SIDEBAR") == "1" or sec != "":
+		toggle.call_deferred()
+	if sec != "":
+		_select.call_deferred(sec)
+
+	for group in SidebarDefs.GROUPS:
+		var gt := TerminalTheme.label(
+				SidebarDefs.group_title(group).to_upper(), 12, Palette.DIM, "medium")
+		var gt_pad := MarginContainer.new()
+		gt_pad.add_theme_constant_override("margin_left", 14)
+		gt_pad.add_theme_constant_override("margin_top", 12)
+		gt_pad.add_theme_constant_override("margin_bottom", 4)
+		gt_pad.add_child(gt)
+		box.add_child(gt_pad)
+		for item in group["items"]:
+			box.add_child(_nav_button(item))
+	BackendBus.chat_unread_changed.connect(func(_unread: Dictionary) -> void:
+		_refresh_chat_badges())
+	_refresh_chat_badges()
+
+func toggle() -> void:
+	_open = not _open
+	_drawer.visible = _open
+	_tab.visible = not _open
+	if not _open:
+		_close_panel()
+	_refresh_chat_badges()
+	Sfx.play_tick()
+
+
+## API pubblica usata dal cambio tema e dall'onboarding: apre il cassetto e
+## mostra direttamente la sezione richiesta senza simulare click.
+func open_section(section: String) -> void:
+	if not _open:
+		toggle()
+	_select(section)
+
+## Colonna dell'icona vettoriale: il testo parte dopo, sempre allineato.
+const ICON_X := 14.0
+const ICON_SIZE := 18.0
+
+## Stile riga di navigazione: sfondo pieno, accento verde a sinistra.
+## `bg_alpha` 0 = trasparente (normal); `accent` accende la barra 3px.
+static func _row_style(bg: Color, bg_alpha: float, accent: bool) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(bg.r, bg.g, bg.b, bg_alpha)
+	sb.set_border_width_all(0)
+	if accent:
+		sb.border_width_left = 3
+		sb.border_color = Palette.GREEN
+	sb.content_margin_left = ICON_X + ICON_SIZE + 8.0
+	sb.content_margin_right = 10
+	sb.content_margin_top = 7
+	sb.content_margin_bottom = 7
+	return sb
+
+func _nav_button(item: Dictionary) -> Control:
+	var btn := Button.new()
+	btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	btn.text = SidebarDefs.label_for(item["id"])
+	btn.add_theme_font_size_override("font_size", 16)
+	btn.add_theme_font_override("font", load(TerminalTheme.FONT_MEDIUM))
+	btn.add_theme_color_override("font_color", Palette.BASE)
+	btn.add_theme_color_override("font_hover_color", Palette.WHITE)
+	btn.add_theme_color_override("font_pressed_color", Palette.GREEN)
+	btn.add_theme_stylebox_override("normal", _row_style(Palette.ROW, 0.0, false))
+	btn.add_theme_stylebox_override("hover", _row_style(Palette.ROW, 0.85, true))
+	btn.add_theme_stylebox_override("pressed", _row_style(Palette.DEEP, 1.0, true))
+	btn.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	btn.pressed.connect(func() -> void: _select(item["id"]))
+	btn.set_meta("label", SidebarDefs.label_for(item["id"]))
+	_buttons[item["id"]] = btn
+
+	# L'icona è un figlio ancorato a metà altezza del Button: resta ferma a
+	# sinistra qualunque sia la lunghezza dell'etichetta tradotta, e non
+	# intercetta i click (mouse_filter IGNORE nel costruttore).
+	var icon := SidebarIcon.new(str(item["icon"]), Palette.BASE)
+	icon.anchor_top = 0.5
+	icon.anchor_bottom = 0.5
+	icon.offset_left = ICON_X
+	icon.offset_right = ICON_X + ICON_SIZE
+	icon.offset_top = -ICON_SIZE * 0.5
+	icon.offset_bottom = ICON_SIZE * 0.5
+	btn.add_child(icon)
+	_icons[item["id"]] = icon
+
+	var pad := MarginContainer.new()
+	pad.add_theme_constant_override("margin_left", 8)
+	pad.add_theme_constant_override("margin_right", 8)
+	pad.add_child(btn)
+	return pad
+
+## Apre (o richiude, se già attiva) la sezione richiesta.
+func _select(section: String) -> void:
+	if section == "chat":
+		_close_panel()
+		chat_requested.emit()
+		return
+	if section == "quit":
+		# Passa dal menu pausa invece di chiudere di colpo: la stessa schermata
+		# di ESC, raggiunta però col mouse. Chi ha cliccato per sbaglio esce da
+		# lì con "Riprendi".
+		_close_panel()
+		Game.open_pause()
+		return
+	if _panel and _panel.section == section:
+		_close_panel()
+		return
+	_close_panel()
+	_panel = SectionPanel.new(section, WIDTH)
+	add_child(_panel)
+	_panel.closed.connect(_close_panel)
+	_panel.navigate.connect(_select)  # es. box pipeline → positions filtrate
+	_set_active(section)
+	Sfx.play_blip()
+
+func _close_panel() -> void:
+	if _panel:
+		_panel.queue_free()
+		_panel = null
+	_set_active("")
+
+func _set_active(section: String) -> void:
+	for id in _buttons:
+		var b: Button = _buttons[id]
+		var active: bool = (id == section)
+		var unread: bool = id == "chat" and BackendBus.total_chat_unread() > 0
+		var tint: Color = Palette.GREEN if active \
+				else (Palette.YELLOW if unread else Palette.BASE)
+		b.add_theme_color_override("font_color", tint)
+		if _icons.has(id):
+			_icons[id].color = tint
+		# la voce attiva tiene sfondo e barra accento anche fuori hover
+		b.add_theme_stylebox_override("normal",
+				_row_style(Palette.DEEP, 1.0, true) if active
+				else _row_style(Palette.ROW, 0.0, false))
+
+func _refresh_chat_badges() -> void:
+	var total := BackendBus.total_chat_unread()
+	if _tab:
+		_tab.text = "≡  ● %d" % total if total > 0 else "≡"
+		_tab.add_theme_color_override("font_color",
+				Palette.YELLOW if total > 0 else Palette.GREEN)
+	if _buttons.has("chat"):
+		var btn: Button = _buttons["chat"]
+		btn.text = "%s%s" % [btn.get_meta("label"),
+				"  ● %d" % total if total > 0 else ""]
+	_set_active(_panel.section if _panel else "")
+
+
+func _open_activation() -> void:
+	if not _open:
+		toggle()
+	_select("activation")
+
+
+func _on_setup_status(status: Dictionary) -> void:
+	if not is_instance_valid(_setup_cta):
+		return
+	var ready := bool(status.get("ready", false))
+	var running := bool(status.get("team_running", false))
+	_setup_cta.visible = not (ready and running)
+	_setup_cta.text = "⚡  " + (UIStrings.t("setup.ready_to_start") if ready \
+			else UIStrings.t("setup.cta") % int(status.get("completed", 0)))
+	_setup_cta.add_theme_color_override("font_color",
+			Palette.GREEN if ready else Palette.YELLOW)
+
+
+func _on_guided_action(action: String, payload: Dictionary) -> void:
+	if OS.get_environment("JHT_GUIDED_TEST") == "1":
+		return
+	if action == "open_section":
+		if not _open:
+			toggle()
+		_select(str(payload.get("section", "activation")))
+	# Il passaggio Assistente → Coordinatore → Mentor nasce sempre da una chat
+	# già aperta: è ChatPanel a riusare la stessa finestra. Gestirlo anche qui
+	# creerebbe due overlay sovrapposti.

@@ -1,0 +1,114 @@
+import { NextResponse } from "next/server";
+import { isLocalRequest } from "./auth";
+import { createClient } from "./supabase/server";
+
+/**
+ * Quando un endpoint shell legacy (es. /api/assistente/start) viene
+ * chiamato da prod cloud (jobhunterteam.ai su Vercel), il filesystem è
+ * read-only e tmux/bash non esistono: l'esecuzione diretta crasha. Il
+ * design lockato (vedi docs/internal/team-commands-bus.md) è che le
+ * richieste cloud vanno dispatchate al bus `team_commands` e il
+ * subscriber sulla VPS le esegue dentro al container.
+ *
+ * `enqueueIfRemote` è il bivio: se la request è local (desktop launcher
+ * apre /api/... su localhost) ritorna null e il caller esegue shell come
+ * sempre; se la request arriva da cloud, inserisce una riga in
+ * team_commands e ritorna la response al client.
+ *
+ * Action enum: start | stop | restart. Target supportati: vedi
+ * /api/team/command/route.ts (VALID_TARGETS).
+ */
+export async function enqueueIfRemote(
+  action: "start" | "stop" | "restart",
+  target: string,
+): Promise<NextResponse | null> {
+  if (await isLocalRequest()) return null;
+
+  // WEB-READONLY (2026-06-20): il controllo del team (start/stop/restart) si fa
+  // SOLO dall'app desktop. Niente piu' dispatch al bus team_commands da cloud:
+  // dal browser e' sola visualizzazione → 403 read_only. Ritiro del path cloud
+  // interattivo (design 2026-06-15). `action`/`target` restano in firma per
+  // compatibilita' coi caller esistenti, ma non vengono piu' accodati.
+  void action;
+  void target;
+  return NextResponse.json(
+    {
+      ok: false,
+      error: "read_only",
+      message:
+        "Il controllo del team si fa dall'app desktop. Dal browser è sola visualizzazione.",
+    },
+    { status: 403 },
+  );
+}
+
+/**
+ * Variante per endpoint desktop-only (terminal native, backup tar): non
+ * c'è dispatch sensato al bus, perché aprire un terminale nativo o
+ * generare un tarball richiede filesystem locale. Restituisce 403 chiaro
+ * se chiamata da cloud.
+ */
+export async function blockIfRemote(
+  hint: string,
+): Promise<NextResponse | null> {
+  if (await isLocalRequest()) return null;
+  return NextResponse.json(
+    {
+      ok: false,
+      error: "operation unavailable on cloud deployment",
+      hint,
+    },
+    { status: 403 },
+  );
+}
+
+/**
+ * Inferenza dello stato active di un agente quando girimo su cloud (no
+ * accesso a tmux della VPS). Logica: l'ultimo comando con
+ * `status='done'` sul bus che ha target `<agent>` o `all` decide. Se
+ * action='start' → active=true, se action='stop' → false. Errori
+ * (status='error') vengono ignorati (non cambiano lo stato precedente).
+ *
+ * Limitazione nota: se la VPS crasha l'utente vedrà ancora "attivo"
+ * finché non riavvia. Per uno stato di salute reale serve un push dal
+ * container (futuro: tabella agent_status aggiornata dal cloud daemon).
+ *
+ * Ritorna null se non c'è auth (caller restituisce 401) o se non ci sono
+ * comandi storici (interpretato come inactive). Altrimenti boolean.
+ */
+export async function inferAgentActiveFromBus(
+  agent:
+    | "assistente"
+    | "capitano"
+    | "sentinella"
+    | "scout"
+    | "scorer"
+    | "analista"
+    | "scrittore"
+    | "critico"
+    | "mentor"
+    | "bridge",
+): Promise<{ active: boolean; userId: string } | null> {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  // Ultimo comando done che impatta questo agente: o target=<agent> o
+  // target='all' (team-wide). Order by processed_at DESC, limit 1.
+  const { data, error } = await supabase
+    .from("team_commands")
+    .select("action, payload, processed_at")
+    .eq("user_id", user.id)
+    .eq("status", "done")
+    .or(`payload->>target.eq.${agent},payload->>target.eq.all`)
+    .order("processed_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error || !data) {
+    return { active: false, userId: user.id };
+  }
+  return { active: data.action === "start", userId: user.id };
+}

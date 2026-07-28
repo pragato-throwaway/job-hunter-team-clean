@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# agent-watchdog.sh — controlla che le 4 sessioni tmux core
+# (ASSISTENTE, CAPITANO, MENTOR, SENTINELLA) siano sempre attive. Se una
+# manca, la rilancia via `jht team start <role>`.
+#
+# Pensato come daemon spawnato da pid1 al boot del container. NON
+# sostituisce il dottore (context-refresh LLM degli agenti CON stato),
+# copre il caso "session tmux morta o non partita".
+#
+# La SENTINELLA ha in più un refresh-per-ETÀ deterministico (vedi
+# maybe_refresh_sentinella): è near-stateless — il suo stato operativo vive
+# nel bridge/config, non nella sua chat — quindi dopo molte ore il suo
+# context window si gonfia e ne degrada il giudizio di pace, e va ricreata
+# fresca oltre una soglia. È age-based, NON health-based: non re-introduce
+# il restart-loop del vecchio sentinel_health (V4 bug). Gli altri core hanno
+# stato e li rinfresca il Dottore (refresh ricco con resume).
+#
+# Loop interval: 30s (configurable via env JHT_AGENT_WATCHDOG_INTERVAL).
+# Idempotente: `jht team start` skippa session già attive.
+# Failure mode: log + retry al prossimo tick, non fail-fast.
+#
+# Trigger gate: parte se active_provider è settato in jht.config.json E
+# le credenziali del provider sono presenti. Telegram NON è più richiesto:
+# l'interazione vive nell'app desktop (chat/feedback dal gioco), Telegram è un
+# canale secondario opzionale. Richiederlo bloccava Capitano/Mentor in
+# modalità no-telegram (il watchdog non li spawnava mai → team monco al boot).
+
+set -u
+
+# jht-tmux-send vive in /app/agents/_tools (come in start-agent.sh): serve per
+# l'escalation al Capitano in maybe_respawn_bridges. Best-effort se assente.
+export PATH="/app/agents/_tools:${PATH}"
+
+JHT_HOME="${JHT_HOME:-/jht_home}"
+CONFIG="$JHT_HOME/jht.config.json"
+JHT_BIN="/app/cli/bin/jht.js"
+INTERVAL_SEC="${JHT_AGENT_WATCHDOG_INTERVAL:-30}"
+LOG="$JHT_HOME/logs/agent-watchdog.log"
+AGENTS=(assistente capitano mentor sentinella)
+# Soglia (ore) oltre cui la sessione SENTINELLA viene ricreata per ripulire
+# il context window accumulato. Refresh deterministico, near-stateless.
+SENTINELLA_MAX_CTX_AGE_H="${JHT_SENTINELLA_MAX_CTX_AGE_H:-24}"
+
+# ── Bridge suite supervision (2026-06-27) ──────────────────────────────
+# I bridge/daemon ausiliari sono lanciati `setsid` detached da start-agent.sh
+# → NON sono figli di pid1, quindi il respawn-on-crash di pid1 NON li copre.
+# Se uno muore (crash da eccezione, OOM-kill) resta giù finché non riparte il
+# container — è il buco che ha lasciato betaC cieco sull'usage per 8h il
+# 2026-06-27. Qui li risorvegliamo a ogni tick. **Anti-flap** (lezione del V4
+# restart-loop, per cui il self-restart del bridge fu RIMOSSO): oltre un cap di
+# respawn in finestra, NON rispawna più e ESCALA al Capitano — niente crash-loop.
+# Vedi docs/internal/postmortems/2026-06-27-betaC-sentinel-bridge-crash.md.
+BRIDGE_STATE_DIR="$JHT_HOME/logs"
+BRIDGE_FLAP_WINDOW_SEC="${JHT_BRIDGE_FLAP_WINDOW_SEC:-600}"   # 10 min
+BRIDGE_FLAP_CAP="${JHT_BRIDGE_FLAP_CAP:-3}"                   # max respawn/finestra
+BRIDGE_ESCALATE_COOLDOWN_SEC="${JHT_BRIDGE_ESCALATE_COOLDOWN_SEC:-3600}"
+# La liveness dei processi la calcola shared/skills/process_health.py (in Python,
+# senza self-match) — stessa fonte di verità del Mantenitore. La suite detached
+# riparabile da un solo `start-agent.sh bridge` è definita lì (gruppo bridge-suite).
+
+mkdir -p "$(dirname "$LOG")"
+
+log() {
+  local ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "[$ts] $*" | tee -a "$LOG"
+}
+
+config_ready() {
+  # active_provider + credenziali OAuth del provider presenti (es. kimi.json
+  # scritto da `kimi --yolo` post-OAuth). Senza credenziali, l'agente parte ma
+  # mostra "LLM not set" e resta inutilizzabile (visto 2026-05-16 in cold fresh
+  # test). Telegram NON è più richiesto (canale secondario opzionale): un bot
+  # configurato è solo INFO, non un prerequisito allo spawn.
+  python3 - "$CONFIG" "$JHT_HOME" 2>/dev/null <<'PYEOF'
+import json, os, sys
+cfg_path, jht_home = sys.argv[1], sys.argv[2]
+try:
+  d = json.load(open(cfg_path))
+except Exception:
+  sys.exit(1)
+prov = (d.get('active_provider') or '').strip().lower()
+# Accettiamo sia il nome-VENDOR del provider (openai/anthropic/kimi — quello che
+# scrive `jht providers use`) sia il nome-CLI storico (codex/claude). Mappano allo
+# stesso marker di credenziali. Un mismatch qui era una timebomb: active_provider=
+# "openai"/"anthropic" cadeva su markers.get(prov,'')='' -> os.path.exists('')=
+# False -> config_ready FALSE in SILENZIO -> il watchdog smetteva di rispawnare
+# CAPITANO/MENTOR dopo un reboot, senza una riga di log (ashley morta ~44h il
+# 2026-07-18, barto armata dopo lo switch a Codex).
+# Vedi docs/internal/postmortems/2026-07-18-provider-vendor-enum-config-ready.md
+markers = {
+  # kimi-cli 1.47+ scrive le creds in .kimi/credentials/<plan>.json
+  # (es. kimi-code.json), non piu' .kimi/kimi.json (allineato a sentinel-bridge).
+  'kimi':      f'{jht_home}/.kimi/credentials/kimi-code.json',
+  'claude':    f'{jht_home}/.claude/.credentials.json',
+  'anthropic': f'{jht_home}/.claude/.credentials.json',
+  'codex':     f'{jht_home}/.codex/auth.json',
+  'openai':    f'{jht_home}/.codex/auth.json',
+}
+has_creds = bool(prov) and os.path.exists(markers.get(prov, ''))
+sys.exit(0 if (prov and has_creds) else 1)
+PYEOF
+}
+
+is_session_alive() {
+  # Bug 2026-05-18 (post-mortem capitano-zombie-night): tmux has-session
+  # ritornava 0 anche quando il process LLM dentro al pane era morto
+  # (kimi crashato, pane ridotto a bash idle). 11h di silent watchdog
+  # mentre il Capitano era zombie e l'utente attendeva risposta.
+  #
+  # Fix: verifica anche pane_current_command. Se non è un LLM CLI noto
+  # (kimi/Kimi/claude/codex/node/python/python3), la sessione è zombie
+  # e va riavviata. La whitelist include 'node'/'python*' per
+  # supportare CLI custom che usano runtime di base (rare ma possibili).
+  local session="$1"
+  tmux has-session -t "$session" 2>/dev/null || return 1
+  local cmd
+  cmd=$(tmux list-panes -t "$session" -F '#{pane_current_command}' 2>/dev/null | head -1)
+  case "$cmd" in
+    [Kk]imi|claude|Claude|codex|Codex|node|python|python3) return 0 ;;
+    *)
+      # Zombie: kill+rispawn al prossimo ensure_agent. Log a basso volume
+      # qui per audit, il messaggio "session zombie — killing" è loud
+      # apposta perché è un evento raro che vogliamo notare.
+      log "agent $session: ZOMBIE detected (pane_current_command='$cmd') — killing session"
+      tmux kill-session -t "$session" 2>/dev/null || true
+      return 1
+      ;;
+  esac
+}
+
+ensure_agent() {
+  local role="$1"
+  local session
+  session="$(echo "$role" | tr '[:lower:]' '[:upper:]')"
+  if is_session_alive "$session"; then
+    return 0
+  fi
+  log "agent $role: session $session non attiva — relancio via jht team start"
+  if /usr/local/bin/node "$JHT_BIN" team start "$role" >>"$LOG" 2>&1; then
+    log "agent $role: start OK"
+  else
+    log "agent $role: start FAIL (rc=$?) — riprovo al prossimo tick"
+  fi
+}
+
+session_age_h() {
+  # Età della sessione tmux in ore intere (now - session_created).
+  local session="$1" created now
+  created=$(tmux display-message -p -t "$session" '#{session_created}' 2>/dev/null) || return 1
+  [ -z "$created" ] && return 1
+  now=$(date -u +%s)
+  echo $(( (now - created) / 3600 ))
+}
+
+maybe_refresh_sentinella() {
+  # Refresh-per-ETÀ della SENTINELLA: near-stateless (stato nel bridge/config,
+  # non nella chat) → un context window vecchio di ore le fa "sbagliare" il
+  # giudizio di pace. Oltre la soglia la si ricrea fresca. age-based (NON
+  # health-based) → niente restart-loop V4. Killa qui: ensure_agent la ricrea
+  # nello stesso tick (subito sotto nel loop). Gli ALTRI core li rinfresca il
+  # Dottore (refresh ricco). Qui solo lei.
+  is_session_alive SENTINELLA || return 0   # se non viva, la (ri)crea ensure_agent
+  # Niente refresh fuori orario lavorativo: ricreare ora sprecherebbe un
+  # kick-off LLM di notte (allineato alla regola "no LLM fuori finestra").
+  python3 -c "import sys; sys.path.insert(0,'/app'); from shared.skills.working_hours import is_within_working_hours as f; sys.exit(0 if f() else 1)" 2>/dev/null || return 0
+  local age
+  age=$(session_age_h SENTINELLA) || return 0
+  if [ "$age" -ge "$SENTINELLA_MAX_CTX_AGE_H" ]; then
+    log "sentinella: context age ${age}h ≥ ${SENTINELLA_MAX_CTX_AGE_H}h — refresh (kill+recreate) per ripulire il contesto"
+    tmux kill-session -t SENTINELLA 2>/dev/null || true
+  fi
+}
+
+bridge_flap_ok() {
+  # 0 se sotto il cap di respawn nella finestra, 1 se il cap è superato.
+  local key="$1" f="$BRIDGE_STATE_DIR/bridge-flap-$1" now cutoff cnt
+  now=$(date -u +%s); cutoff=$((now - BRIDGE_FLAP_WINDOW_SEC))
+  [ -f "$f" ] || return 0
+  cnt=$(awk -v c="$cutoff" '$1+0>=c' "$f" 2>/dev/null | wc -l | tr -d ' ')
+  [ "${cnt:-0}" -lt "$BRIDGE_FLAP_CAP" ]
+}
+
+bridge_flap_record() {
+  # appende 'now' e pota i timestamp fuori finestra (rolling window).
+  local key="$1" f="$BRIDGE_STATE_DIR/bridge-flap-$1" now cutoff
+  now=$(date -u +%s); cutoff=$((now - BRIDGE_FLAP_WINDOW_SEC))
+  { [ -f "$f" ] && awk -v c="$cutoff" '$1+0>=c' "$f" 2>/dev/null; echo "$now"; } \
+    > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null || true
+}
+
+bridge_escalate() {
+  # avvisa il Capitano UNA volta per finestra di cooldown (no spam), poi tace.
+  local what="$1" now ef last
+  now=$(date -u +%s)
+  ef="$BRIDGE_STATE_DIR/bridge-escalate.ts"
+  if [ -f "$ef" ]; then
+    last=$(cat "$ef" 2>/dev/null || echo 0)
+    [ $((now - last)) -lt "$BRIDGE_ESCALATE_COOLDOWN_SEC" ] && return 0
+  fi
+  echo "$now" > "$ef" 2>/dev/null || true
+  log "bridge-watchdog: FLAP CAP superato ($what) — STOP respawn, escalo al Capitano"
+  jht-tmux-send CAPITANO "[WATCHDOG] $what continua a morire (>${BRIDGE_FLAP_CAP} respawn in $((BRIDGE_FLAP_WINDOW_SEC/60))min). Ho FERMATO il respawn automatico per evitare un crash-loop. Serve diagnosi manuale: controlla \$JHT_HOME/logs/*-bridge.log. Il Mantenitore farà comunque un canary completo al prossimo sweep." >/dev/null 2>&1 || true
+}
+
+tg_bots_configured() {
+  # vero se almeno un bot Telegram ha un token (channels.telegram.bots.<role>).
+  python3 - "$CONFIG" 2>/dev/null <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+bots = (d.get("channels", {}) or {}).get("telegram", {}).get("bots", {}) or {}
+sys.exit(0 if any((b or {}).get("bot_token") for b in bots.values()) else 1)
+PYEOF
+}
+
+maybe_respawn_bridges() {
+  # Liveness via process_health.py (legge /proc in PYTHON → NIENTE self-match,
+  # a differenza di `grep MARKER /proc/*/cmdline` che trova il proprio argv e
+  # riporterebbe SEMPRE "vivo"). Unica fonte di verità, condivisa col Mantenitore
+  # (step 0 di maintainer-sweep). In steady-state: 1 call, tutti vivi, zero azione.
+  local plan PROC_DEAD_BRIDGE_SUITE="" PROC_DEAD_DEEP="" PROC_TG_ALIVE=0 PROC_ALL_OK=1
+  # NB: process_health.py esce 1 PROPRIO quando c'è un morto (è il caso che ci
+  # interessa) → NON gatare su `|| return` sull'exit code, sarebbe un no-op
+  # esattamente quando serve agire. Catturiamo l'output sempre; skip solo se vuoto
+  # (python assente/errore reale).
+  plan=$(python3 /app/shared/skills/process_health.py summary --shell 2>/dev/null)
+  [ -z "$plan" ] && return 0
+  eval "$plan" 2>/dev/null || return 0
+  [ "${PROC_ALL_OK:-1}" = "1" ] && [ -z "$PROC_DEAD_BRIDGE_SUITE" ] && [ "${PROC_TG_ALIVE:-9}" -ge 3 ] && return 0
+
+  # (1) bridge-suite morti → un solo `start-agent.sh bridge` li rispawna tutti
+  #     (idempotente kill+respawn). Anti-flap: oltre il cap, escala invece di loopare.
+  if [ -n "$PROC_DEAD_BRIDGE_SUITE" ]; then
+    if bridge_flap_ok bridge; then
+      log "bridge-watchdog: suite incompleta (morti: $PROC_DEAD_BRIDGE_SUITE) — respawn via start-agent.sh bridge"
+      JHT_HOME="$JHT_HOME" bash /app/.launcher/start-agent.sh bridge >>"$LOG" 2>&1 \
+        || log "bridge-watchdog: respawn bridge FAIL (rc=$?)"
+      bridge_flap_record bridge
+    else
+      bridge_escalate "suite bridge (morti: $PROC_DEAD_BRIDGE_SUITE)"
+    fi
+  fi
+
+  # (2) tg-bridge: canale Telegram OPZIONALE → respawn solo se i bot sono
+  #     configurati e mancano istanze (attese >=3 process: wrapper+python ×3).
+  if tg_bots_configured && [ "${PROC_TG_ALIVE:-0}" -lt 3 ]; then
+    if bridge_flap_ok tg-bridge; then
+      log "bridge-watchdog: tg-bridge incompleto (${PROC_TG_ALIVE}/3 process) — respawn via start-agent.sh tg-bridge"
+      JHT_HOME="$JHT_HOME" bash /app/.launcher/start-agent.sh tg-bridge >>"$LOG" 2>&1 \
+        || log "bridge-watchdog: respawn tg-bridge FAIL (rc=$?)"
+      bridge_flap_record tg-bridge
+    else
+      bridge_escalate "tg-bridge (${PROC_TG_ALIVE}/3)"
+    fi
+  fi
+
+  # (3) Process "profondi" morti (doctor-watchdog/auto-report/cloud-daemon/pid1):
+  #     dovrebbe rispawnarli pid1. Se restano morti è un problema più serio →
+  #     ESCALA (NON tentare il respawn da qui: li orfaneremmo). agent-watchdog
+  #     non comparirà mai qui (è il processo che gira questo check).
+  if [ -n "$PROC_DEAD_DEEP" ]; then
+    bridge_escalate "process pid1-managed morti: $PROC_DEAD_DEEP"
+  fi
+}
+
+log "watchdog start · interval=${INTERVAL_SEC}s · agents=${AGENTS[*]} · sentinella_max_ctx_age=${SENTINELLA_MAX_CTX_AGE_H}h · bridge_supervision=on (flap_cap=${BRIDGE_FLAP_CAP}/$((BRIDGE_FLAP_WINDOW_SEC/60))min)"
+
+# Loop principale: gate sulla config (può non essere ancora pronta al
+# primo boot del container — il wizard la scrive post-pairing). Sleep
+# tra un tick e l'altro anche quando non facciamo niente: non vogliamo
+# saturare CPU.
+trap 'log "watchdog shutdown (SIGTERM)"; exit 0' TERM INT
+
+TEAM_HALTED_FLAG="$JHT_HOME/.team-halted.flag"
+WEEKLY_HALT_FLAG="$JHT_HOME/.weekly-halt.flag"
+halt_log_tick=0
+# Contatore per rendere LOUD un config_ready=false PERSISTENTE (ramo else in fondo
+# al loop): al primo boot è normale (wizard non ancora finito), ma oltre la grace
+# è un guasto reale che NON deve restare invisibile. Grace ~5min @ 30s/tick.
+config_not_ready_tick=0
+CONFIG_NOT_READY_GRACE_TICKS="${JHT_CONFIG_NOT_READY_GRACE_TICKS:-10}"
+
+while true; do
+  # Team-halted gate (set by team-state-reconciler quando user clicca Stop
+  # dalla dashboard). Source of truth: team_state.should_run. Quando
+  # presente, NIENTE respawn — l'utente ha esplicitamente fermato.
+  # Stesso comportamento per .weekly-halt.flag (limite rate budget).
+  if [ -e "$TEAM_HALTED_FLAG" ] || [ -e "$WEEKLY_HALT_FLAG" ]; then
+    if [ $((halt_log_tick % 20)) -eq 0 ]; then
+      if [ -e "$TEAM_HALTED_FLAG" ]; then
+        log "halt: .team-halted.flag presente — respawn agenti disabilitato"
+      else
+        log "halt: .weekly-halt.flag presente — respawn agenti disabilitato"
+      fi
+    fi
+    halt_log_tick=$((halt_log_tick + 1))
+    sleep "$INTERVAL_SEC"
+    continue
+  fi
+  if [ "$halt_log_tick" -gt 0 ]; then
+    log "halt: flag rimosso — riprendo respawn watchdog"
+    halt_log_tick=0
+  fi
+
+  if config_ready; then
+    if [ "$config_not_ready_tick" -gt 0 ]; then
+      log "config: tornata pronta dopo ${config_not_ready_tick} tick — riprendo respawn agenti"
+      config_not_ready_tick=0
+    fi
+    # Refresh-per-età della Sentinella PRIMA del giro di ensure: se è troppo
+    # vecchia la killa, poi ensure_agent la ricrea fresca nello stesso tick.
+    maybe_refresh_sentinella
+    for role in "${AGENTS[@]}"; do
+      ensure_agent "$role"
+    done
+    # Bridge/daemon detached (sentinel/pacing/heartbeat-bridge/window-ratio/
+    # codex-auth-healer + tg-bridge): respawn se morti, con anti-flap. Sono
+    # fuori dal respawn-on-crash di pid1 (setsid), questo è il loro recovery.
+    maybe_respawn_bridges
+  else
+    # config non pronta. Al primo boot è NORMALE (il wizard la scrive post-pairing):
+    # restiamo silenziosi per i primi CONFIG_NOT_READY_GRACE_TICKS. Ma se PERSISTE
+    # oltre la grace è un guasto vero (active_provider fuori-mappa, credenziali
+    # mancanti) e NON deve più essere invisibile: quella silenziosità ha tenuto
+    # ashley morta ~44h il 2026-07-18 senza una riga di log. Escaliamo a log loud.
+    if [ "$config_not_ready_tick" -eq "$CONFIG_NOT_READY_GRACE_TICKS" ]; then
+      _prov="$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('active_provider') or '?').strip() or '?')" "$CONFIG" 2>/dev/null || echo '?')"
+      log "config NON pronta da ${CONFIG_NOT_READY_GRACE_TICKS} tick (~$((CONFIG_NOT_READY_GRACE_TICKS*INTERVAL_SEC/60))min): active_provider='${_prov}' senza marker credenziali valido — respawn CAPITANO/MENTOR SOSPESO. Se non è il wizard iniziale, verifica active_provider vs mappa in config_ready()."
+    elif [ "$config_not_ready_tick" -gt "$CONFIG_NOT_READY_GRACE_TICKS" ] && [ $((config_not_ready_tick % 60)) -eq 0 ]; then
+      log "config ancora NON pronta (tick=${config_not_ready_tick}) — respawn agenti tuttora sospeso"
+    fi
+    config_not_ready_tick=$((config_not_ready_tick + 1))
+  fi
+  sleep "$INTERVAL_SEC"
+done

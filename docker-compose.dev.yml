@@ -1,0 +1,35 @@
+# Job Hunter Team — Dev override
+#
+# Override del docker-compose.yml di produzione per il dev workflow:
+# build locale dell'immagine + bind-mount dei sorgenti per hot-reload.
+#
+# Uso:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Equivalente al vecchio `docker compose up -d` pre 2026-05-06 (split
+# host/container, vedi docs/internal/vps.md).
+#
+# Cosa cambia rispetto al compose di produzione:
+# - build locale dal Dockerfile (sovrascrive l'immagine GHCR pullata)
+# - bind-mount di agents/, shared/, .launcher/ per modifiche visibili
+#   senza ricostruire l'immagine
+#
+# NB: niente mount di ./web e niente polling watcher (WATCHPACK_POLLING &
+# co.). La dashboard web locale è stata ritirata (2026-07-23) e il Dockerfile
+# non installa più le dipendenze di web/: nel container non gira alcun Next.js
+# da ricompilare. Il mount serviva solo a quello e i volumi anonimi su
+# node_modules/.next mascheravano la directory montata. Rimossi il 2026-07-26.
+
+services:
+  jht:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Sorgenti del repo — hot-reload senza rebuild dell'immagine:
+      # start-agent.sh rilegge i prompt markdown a ogni lancio agente e le
+      # skill/bridge sono i file più modificati durante lo sviluppo (senza
+      # bind-mount ogni fix richiederebbe un rebuild o un docker cp a mano).
+      - ./agents:/app/agents
+      - ./shared:/app/shared
+      - ./.launcher:/app/.launcher

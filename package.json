@@ -1,0 +1,41 @@
+{
+  "name": "job-hunter-team",
+  "version": "0.3.0",
+  "description": "An open-source multi-agent AI framework that automates your job search — from position discovery to tailored CVs and cover letters.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leopu00/job-hunter-team.git"
+  },
+  "homepage": "https://jobhunterteam.ai",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:py": "python3 -m pytest tests/",
+    "test:all": "npm run test && npm run test:js && npm run test:py",
+    "test:js": "npm run test:js:install && npm --prefix tests/js test",
+    "test:js:install": "for d in tests/js web cli shared shared/cron; do (cd \"$d\" && npm ci --no-audit --no-fund) || exit 1; done",
+    "dev:up": "bash scripts/dev-up.sh",
+    "dev:down": "bash scripts/dev-down.sh",
+    "lint": "npm run lint --prefix web",
+    "format:check": "npx prettier --check \"web/app/**/*.{ts,tsx}\" \"shared/**/*.ts\"",
+    "app:test": "./game/tools/run.sh test",
+    "app:dev": "./game/tools/run.sh play",
+    "app:dist": "./scripts/build-release.sh auto"
+  },
+  "keywords": [],
+  "author": "Leone Emanuel Puglisi <support@jobhunterteam.ai>",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.2.2",
+    "vitest": "^4.1.10"
+  }
+}

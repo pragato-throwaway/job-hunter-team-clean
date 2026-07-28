@@ -1,0 +1,47 @@
+"use client";
+
+import { useLocale } from "@/lib/use-locale";
+import type { Locale } from "@/i18n/config";
+
+const T: Record<Locale, string> = {
+  it: "Caricamento Team",
+  en: "Loading Team",
+  es: "Cargando Equipo",
+  fr: "Chargement de l'Équipe",
+  de: "Team wird geladen",
+  hu: "Csapat betöltése",
+  pt: "Carregando Equipe",
+};
+
+export default function Loading() {
+  const t = T[useLocale()];
+  return (
+    <div
+      aria-busy="true"
+      aria-label={t}
+      style={{ animation: "fade-in 0.2s ease both" }}
+    >
+      <div className="mb-8 pb-6 border-b border-[var(--color-border)]">
+        <div className="h-7 w-48 rounded bg-[var(--color-border)] mb-2 animate-pulse" />
+        <div className="h-3 w-64 rounded bg-[var(--color-border)] animate-pulse" />
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div
+            key={i}
+            className="bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg p-4"
+          >
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-10 h-10 rounded-lg bg-[var(--color-border)] animate-pulse" />
+              <div>
+                <div className="h-3.5 w-24 rounded bg-[var(--color-border)] mb-1 animate-pulse" />
+                <div className="h-2.5 w-16 rounded bg-[var(--color-border)] animate-pulse" />
+              </div>
+            </div>
+            <div className="h-2 w-full rounded bg-[var(--color-border)] animate-pulse" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────
+# Job Hunter Team — Pre-release version consistency check
+#
+# Verifies that the git tag matches the root package and every Godot
+# application metadata field. Godot is the only desktop application.
+#
+# Usage:
+#   scripts/check-release-version.sh [TAG]
+#
+# TAG resolution order:
+#   1. First positional argument
+#   2. $GITHUB_REF_NAME (set by GitHub Actions)
+#   3. git describe --exact-match --tags HEAD
+#
+# Exit codes:
+#   0  versions aligned
+#   1  no tag resolvable
+#   2  tag format invalid (expected vX.Y.Z[-prerelease])
+#   3  version mismatch
+# ──────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+error() { echo "[check-release-version] ERROR: $*" >&2; }
+info()  { echo "[check-release-version] $*"; }
+
+TAG="${1:-${GITHUB_REF_NAME:-}}"
+if [ -z "$TAG" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+  TAG="$(git describe --exact-match --tags HEAD 2>/dev/null || true)"
+fi
+
+if [ -z "$TAG" ]; then
+  error "no tag provided (pass as first arg, set GITHUB_REF_NAME, or tag HEAD)"
+  exit 1
+fi
+
+if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+  error "tag '$TAG' does not match the expected format 'vX.Y.Z' (optional '-prerelease' suffix)"
+  exit 2
+fi
+
+TAG_VERSION="${TAG#v}"
+
+if git rev-parse --show-toplevel >/dev/null 2>&1; then
+  ROOT="$(git rev-parse --show-toplevel)"
+else
+  ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+
+read_version() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    error "missing $file"
+    return 1
+  fi
+  awk -F'"' '/^[[:space:]]*"version"[[:space:]]*:/ {print $4; exit}' "$file"
+}
+
+ROOT_PKG="$ROOT/package.json"
+GAME_PROJECT="$ROOT/game/project.godot"
+GAME_PRESETS="$ROOT/game/export_presets.cfg"
+
+ROOT_VERSION="$(read_version "$ROOT_PKG")"
+GAME_VERSION="$(awk -F'=' '/^config\/version=/{gsub(/"/, "", $2); print $2; exit}' "$GAME_PROJECT")"
+GAME_MAC_SHORT="$(awk -F'=' '/^application\/short_version=/{gsub(/"/, "", $2); print $2; exit}' "$GAME_PRESETS")"
+GAME_MAC_VERSION="$(awk -F'=' '/^application\/version=/{gsub(/"/, "", $2); print $2; exit}' "$GAME_PRESETS")"
+GAME_WIN_FILE="$(awk -F'=' '/^application\/file_version=/{gsub(/"/, "", $2); print $2; exit}' "$GAME_PRESETS")"
+GAME_WIN_PRODUCT="$(awk -F'=' '/^application\/product_version=/{gsub(/"/, "", $2); print $2; exit}' "$GAME_PRESETS")"
+GAME_NUMERIC_VERSION="${TAG_VERSION%%-*}.0"
+
+info "tag:      $TAG (version $TAG_VERSION)"
+info "root:     $ROOT_VERSION  ($ROOT_PKG)"
+info "game:     $GAME_VERSION  ($GAME_PROJECT)"
+info "game mac: $GAME_MAC_SHORT / $GAME_MAC_VERSION"
+info "game win: $GAME_WIN_FILE / $GAME_WIN_PRODUCT"
+
+mismatch=0
+if [ "$ROOT_VERSION" != "$TAG_VERSION" ]; then
+  error "root package.json version ($ROOT_VERSION) does not match tag ($TAG_VERSION)"
+  mismatch=1
+fi
+if [ "$GAME_VERSION" != "$TAG_VERSION" ] || \
+   [ "$GAME_MAC_SHORT" != "$TAG_VERSION" ] || \
+   [ "$GAME_MAC_VERSION" != "$TAG_VERSION" ]; then
+  error "Godot project/macOS metadata does not match tag ($TAG_VERSION)"
+  mismatch=1
+fi
+if [ "$GAME_WIN_FILE" != "$GAME_NUMERIC_VERSION" ] || \
+   [ "$GAME_WIN_PRODUCT" != "$GAME_NUMERIC_VERSION" ]; then
+  error "Godot Windows metadata must be numeric $GAME_NUMERIC_VERSION"
+  mismatch=1
+fi
+
+if [ "$mismatch" -ne 0 ]; then
+  error "bump package.json and Godot version metadata, commit, re-tag, and push again"
+  exit 3
+fi
+
+info "OK — all versions aligned with tag $TAG"

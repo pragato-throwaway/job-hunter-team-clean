@@ -1,0 +1,53 @@
+# Skills the Capitano consumes from agents/_skills/.
+# One name per line. Lines starting with `#` and blank lines are ignored.
+# The launcher (start-agent.sh) reads this file at boot and copies the
+# listed skills into the agent's ~/.claude/skills/ runtime workspace.
+
+# Inter-agent + user communication
+tmux-send
+
+# Chiusura ordinata quando l'utente esce dall'applicazione: ogni agente
+# annota dove era arrivato, poi il flag lascia chiudere il gioco.
+graceful-shutdown
+chat-web
+game-reply-options
+# Phone-side outbound: notifiche batch + risposte all'utente sul bot Capitano
+telegram-send
+
+# Notifiche utente con fallback Telegram -> dashboard web (batch ready, alert)
+notify-user
+
+# Pickup risposte utente arrivate via dashboard web (marker prompt-injection)
+user-reply-check
+
+# DB access (read + targeted update; the Captain does NOT insert)
+db-query
+db-update
+
+# Primo avvio di un utente nuovo: roster completo subito invece della salita
+# a gradini, perché il risultato che conta è una posizione CON PUNTEGGIO.
+first-run-burst
+
+# Coordination (the Captain's daily operational loop)
+spawn-agent
+sentinel-orders
+bridge-pacing
+bridge-mailbox
+pipeline-triage
+# Calibrazione graduale del roster: quanti worker + che throttle per centrare
+# la velocità-target, con piano a scaglioni (C-02, anti ACCELERARE→marathon).
+scaling-calc
+
+# Emergency: spawn fresh DOTTORE on-demand quando serve health-check
+# subito (post-mortem 2026-05-18: tra cicli auto il DOTTORE è bash
+# residua, scrivergli è inutile, va spawnato ex-novo).
+spawn-doctor
+
+# Emergency: agente sospettato BLOCCATO IN LOOP attivo (vivo+ripete senza
+# produrre) — crepa fra C-08 (morto) e C-12 (cadenza 0.00). Rileva deterministico
+# (capture-pane diff + 0 avanzamento DB) -> Dottore-first -> kill (C-14).
+agent-emergency
+
+# Throttle config + on-demand rate-budget probe (rare, for ad-hoc diagnosis)
+throttle
+rate-budget

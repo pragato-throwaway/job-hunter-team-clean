@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# jht-tmux-send — consegna atomica e VERIFICATA di un messaggio a una
+# sessione tmux. Pensato per agent-to-agent via TUI (Claude / Codex / Kimi).
+#
+# Le TUI "Ink" (Codex, Kimi, Claude Code) non registrano l'Enter se
+# arriva prima che il testo sia renderizzato nel prompt: testo e Enter
+# vanno inviati in step separati, e il submit deve arrivare DOPO che il
+# testo e' effettivamente apparso nel pane.
+#
+# Schema:
+#   0. capture-pane            se la TUI e' a META' TURNO ("esc to interrupt")
+#                              NON e' morta: e' VIVA e occupata. Aspetta che
+#                              torni idle PRIMA di digitare — non si typea mai
+#                              dentro un composer occupato (codex accoda+non
+#                              eco-a il testo → la verify fallirebbe a vuoto).
+#   1. send -l "$message"      tmux typea il testo carattere per carattere
+#   2. sleep 1                 lascia respirare il render Ink
+#   3. capture-pane            verifica che la signature sia nel pane
+#   4. se NO → retry (fino a 3 volte; la TUI potrebbe stare bootando,
+#              avere un modal aperto, o aver perso focus)
+#   5. se SI → send Enter      submit del prompt
+#
+# Uso:
+#   jht-tmux-send SESSION "[@capitano -> @scout-1] [MSG] ..."
+#
+# Exit:
+#   0 → messaggio consegnato e submittato
+#   1 → argomenti mancanti
+#   2 → sessione inesistente
+#   3 → testo mai apparso nel pane E pane NON occupato → TUI irricettiva
+#       (probabile bash nudo post-crash / modal bloccato): unico segnale "morto".
+#   4 → TUI occupata (turno in corso) oltre il budget d'attesa → agente VIVO:
+#       messaggio NON consegnato in sincrono, il chiamante deve RIPROVARE piu'
+#       tardi, MAI spawnare un rimpiazzo. "Busy != morto" (vedi
+#       docs/internal/postmortems/2026-06-11-overspawn-rootcause.md).
+
+set -euo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "Usage: jht-tmux-send <session> <message>" >&2
+  echo "Esempio: jht-tmux-send SCOUT-1 '[@capitano -> @scout-1] [MSG] Inizia il loop.'" >&2
+  exit 1
+fi
+
+session="$1"
+shift
+# Supportiamo sia la forma "quotata" (un solo arg) sia lo splat accidentale
+# (piu' arg con spazi) — in quest'ultimo caso ricomponiamo con spazi.
+message="$*"
+
+if ! tmux has-session -t "$session" 2>/dev/null; then
+  echo "jht-tmux-send: sessione '$session' non esiste" >&2
+  exit 2
+fi
+
+# Provider attivo: serve a sapere se la TUI di destinazione è Kimi, che
+# accoda i messaggi inviati con solo Enter mentre l'agente è in mezzo a
+# tool calls in-flight (osservato live: SCOUT-1 con 4 throttle in coda
+# non processati). Soluzione: dopo Enter mandiamo anche Ctrl-S, che in
+# Kimi forza il submit del prompt corrente. Su Claude/Codex Ctrl-S non
+# è atteso, quindi lo aggiungiamo SOLO se active_provider == "kimi".
+provider=""
+config_path="${JHT_HOME:-$HOME/.jht}/jht.config.json"
+if [ -f "$config_path" ] && command -v python3 >/dev/null 2>&1; then
+  provider=$(python3 -c "import json,sys
+try:
+  print(json.load(open(sys.argv[1])).get('active_provider',''))
+except Exception:
+  pass" "$config_path" 2>/dev/null || true)
+fi
+
+# Log strutturato per la UI live: parsa il formato "[@from -> @to] [TYPE] ..."
+# e appendix una riga JSONL in $JHT_HOME/logs/messages.jsonl. Il backend
+# Next legge questo file per animare il pallino tra i nodi del team chart.
+# Fallisce silenziosamente — il logging non deve mai bloccare l'invio.
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$session" "$message" <<'PYEOF' 2>/dev/null || true
+import json, os, re, sys
+from datetime import datetime, timezone
+session, msg = sys.argv[1], sys.argv[2]
+# 1) formato standard agente→agente: "[@from -> @to] [TYPE] ..."
+m = re.match(r'^\s*\[@([a-zA-Z0-9_-]+)\s*->\s*@([a-zA-Z0-9_-]+)\]\s*(?:\[([A-Z]+)\])?', msg)
+if m:
+    from_, to_, kind = m.group(1), m.group(2), m.group(3) or ""
+else:
+    # 2a) pacing-bridge: "[BRIDGE PACING] ..." — nodo separato dal Bridge
+    #     classico (sentinel) nel team chart. Marcato come from=pacing per
+    #     far partire il pallino dal nodo Pacing → Capitano.
+    mp = re.match(r'^\s*\[BRIDGE\s+PACING\]', msg)
+    if mp:
+        from_, to_, kind = "pacing", session.lower(), "PACING"
+    # 2b) bridge automatico: "[BRIDGE TICK|FAILURE|ALERT|INFO] ..." → la
+    #     destinazione è la session destinataria (passata come argv[1]).
+    elif (mb := re.match(r'^\s*\[BRIDGE\s+([A-Z]+)\]', msg)):
+        from_, to_, kind = "bridge", session.lower(), mb.group(1)
+    else:
+        # 3) sentinella autonoma: "[SENTINELLA] ..." o "[SENTINELLA] [TYPE] ..."
+        ms = re.match(r'^\s*\[SENTINELLA\]\s*(?:\[([A-Z]+)\])?', msg)
+        if ms:
+            from_, to_, kind = "sentinella", session.lower(), ms.group(1) or ""
+        else:
+            from_, to_, kind = "", "", ""
+log_dir = os.path.join(os.environ.get("JHT_HOME") or os.path.expanduser("~/.jht"), "logs")
+os.makedirs(log_dir, exist_ok=True)
+out = {
+    "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    "session": session,
+    "from": from_.lower(),
+    "to": to_.lower(),
+    "type": kind,
+    # Keep preview for backwards compat with older readers, but also persist
+    # the FULL message body so the case-studies UI can show what the agents
+    # actually said. Cap at 4kB just to bound the log line size.
+    "preview": msg[:80],
+    "body": msg[:4096],
+}
+with open(os.path.join(log_dir, "messages.jsonl"), "a") as f:
+    f.write(json.dumps(out, ensure_ascii=False) + "\n")
+PYEOF
+fi
+
+# Signature per la verify: primi 30 char del messaggio. Substring perche'
+# le TUI wrappano righe lunghe e il messaggio nel pane puo' essere spezzato
+# su piu' righe, rendendo un match full-string impossibile.
+signature=$(printf '%s' "$message" | head -c 30)
+
+# Busy-detection: codex / claude / kimi mostrano "esc to interrupt" mentre
+# l'agente e' a meta' turno. In quello stato il composer NON eco-a il testo
+# digitato → la signature non comparirebbe mai e concluderemmo a torto che la
+# TUI e' irricettiva (morta). Un pane occupato e' un agente VIVO: aspettiamo
+# che torni idle prima di typeare, MAI typeare dentro un turno in corso.
+# Causa radice dell'overspawn 07/06 (docs/internal/postmortems/2026-06-11-overspawn-rootcause.md).
+_pane_busy() {
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    *"esc to interrupt"*|*"to interrupt"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Quanto attendere che un turno in corso finisca prima di rinunciare (exit 4,
+# VIVO). I turni codex lunghi (parsing, edit grossi) durano minuti: budget alto
+# abbastanza da cavalcare un turno normale, ma bounded per non bloccare il
+# mittente (Capitano) all'infinito. Override via env JHT_TMUX_BUSY_WAIT.
+busy_budget="${JHT_TMUX_BUSY_WAIT:-90}"
+
+attempts=3
+for try in $(seq 1 "$attempts"); do
+  pane=$(tmux capture-pane -t "$session" -p 2>/dev/null || true)
+
+  # Se la TUI e' a meta' turno, aspetta l'idle PRIMA di digitare.
+  if _pane_busy "$pane"; then
+    waited=0
+    while [ "$waited" -lt "$busy_budget" ]; do
+      sleep 3
+      waited=$((waited + 3))
+      pane=$(tmux capture-pane -t "$session" -p 2>/dev/null || true)
+      _pane_busy "$pane" || break
+    done
+    if _pane_busy "$pane"; then
+      # Ancora occupato dopo tutto il budget → agente VIVO, solo su un turno
+      # molto lungo. Segnala VIVO-occupato (exit 4), NON morto (exit 3): il
+      # chiamante deve riprovare piu' tardi, mai spawnare un rimpiazzo.
+      echo "jht-tmux-send: $session occupato (turno in corso) dopo ${busy_budget}s — VIVO, riprova piu' tardi" >&2
+      exit 4
+    fi
+  fi
+
+  tmux send-keys -t "$session" -l "$message"
+  sleep 1
+  pane=$(tmux capture-pane -t "$session" -p 2>/dev/null || true)
+  case "$pane" in
+    *"$signature"*|*"Pasted text"*|*"pasted text"*|*"Pasted Content"*|*"pasted content"*)
+      # Testo visibile nel prompt (match diretto del signature) OPPURE la TUI
+      # ha COLLASSATO un paste multi-riga in un placeholder: Claude Code lo
+      # chiama "[Pasted text +N lines]", OpenAI Codex "[Pasted Content N chars]"
+      # (il signature non comparirebbe mai → senza questi rami l'Enter non
+      # verrebbe inviato e il messaggio resterebbe appeso nel composer, con
+      # l'agente che non parte mai — onboarding Codex rotto, Leone 24/07). In
+      # tutti i casi il testo è nel buffer di input → submit.
+      sleep 0.3
+      tmux send-keys -t "$session" Enter
+      # Kimi: con solo Enter il messaggio puo' restare accodato in pending
+      # input fino a fine batch di tool calls; Ctrl-S forza il submit
+      # immediato del prompt. Innocuo se la TUI ha gia' processato Enter.
+      if [ "$provider" = "kimi" ]; then
+        sleep 0.2
+        tmux send-keys -t "$session" C-s
+      fi
+      echo "jht-tmux-send: ${#message} chars to $session (try $try)"
+      exit 0
+      ;;
+  esac
+  # Testo perso. Casi: (a) il typing ha fatto partire un turno → il busy-check
+  # in cima alla prossima iterazione lo cattura e aspetta; (b) la TUI e' in boot
+  # o ha un modal aperto che ha mangiato i keystroke. Pausa e ritenta.
+  #
+  # Modal di primo avvio che mangia i keystroke (es. Claude Code v2.1.x "Try
+  # the new fullscreen renderer?", theme-picker, "what's new", update-prompt):
+  # il pane NON e' busy e il testo non compare. Mandiamo Esc — il "cancel"
+  # generico che chiude QUALSIASI prompt senza confermarne una scelta (MAI
+  # Enter, che selezionerebbe il default: sul fullscreen sarebbe "Yes" → attiva
+  # l'alternate screen e rompe capture-pane). Poi il typing riparte alla
+  # prossima iterazione. Robusto e future-proof per claude/codex/kimi, a
+  # prescindere da quale nuovo prompt introducano (Leone 24/07).
+  if ! _pane_busy "$pane"; then
+    tmux send-keys -t "$session" Escape 2>/dev/null || true
+  fi
+  sleep 1.5
+done
+
+# Retry esauriti e pane NON occupato → genuinamente irricettivo (bash nudo
+# post-crash, modal bloccato): unico vero segnale "forse morto" (exit 3).
+echo "jht-tmux-send: $session non ricettivo dopo $attempts tentativi (testo mai apparso, pane non occupato)" >&2
+exit 3

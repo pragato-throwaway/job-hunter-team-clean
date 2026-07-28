@@ -1,0 +1,17 @@
+{
+  "name": "jht-tests-js",
+  "version": "0.1.7",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@grammyjs/auto-retry": "^2.0.2",
+    "@grammyjs/runner": "^2.0.3",
+    "grammy": "^1.45.1",
+    "vitest": "^4.1.8",
+    "zod": "^4.3.6"
+  }
+}

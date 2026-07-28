@@ -1,0 +1,53 @@
+{
+  "name": "jht-web",
+  "version": "0.3.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "dev:host": "JHT_SHELL_VIA=docker:jht next dev -p 3001",
+    "dev:host:3002": "JHT_SHELL_VIA=docker:jht next dev -p 3002",
+    "dev:cloud:3003": "NEXT_PUBLIC_JHT_DEPLOY=cloud next dev -p 3003",
+    "build": "next build",
+    "analyze": "ANALYZE=true next build --webpack",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.12.0",
+    "@supabase/supabase-js": "^2.110.0",
+    "@vercel/analytics": "^2.0.1",
+    "@vercel/speed-insights": "^2.0.0",
+    "better-sqlite3": "^12.10.0",
+    "ipaddr.js": "^2.2.0",
+    "js-yaml": "^4.1.1",
+    "maplibre-gl": "^5.24.0",
+    "next": "^16.2.11",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@next/bundle-analyzer": "^16.2.6",
+    "@tailwindcss/postcss": "^4",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.13.2",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "^16.2.10",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "@swc/helpers": "^0.5.17",
+    "postcss": "^8.5.23",
+    "sharp": "^0.35.3"
+  },
+  "license": "MIT",
+  "author": "Leone Emanuel Puglisi <support@jobhunterteam.ai>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leopu00/job-hunter-team.git"
+  },
+  "description": "Job Hunter Team web dashboard (Next.js)"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "jht-cron",
+  "version": "0.2.1",
+  "description": "JHT scheduling system for recurring tasks",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "croner": "^9.0.0"
+  },
+  "license": "MIT",
+  "author": "Leone Emanuel Puglisi <support@jobhunterteam.ai>"
+}
